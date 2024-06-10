@@ -170,6 +170,7 @@ def main(_argv):
     tracking_data = {}
     predicted_trajectories = {}
     trail_overlay = np.zeros((height, width, 3), dtype=np.uint8)
+    prediction_overlay = np.zeros((height, width, 3), dtype=np.uint8)  # For permanent predictions
 
     while True:
         return_value, frame = vid.read()
@@ -211,7 +212,6 @@ def main(_argv):
 
         tracker.predict()
         tracker.update(detections)
-        trail_overlay.fill(0)  # Clear previous prediction lines
 
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
@@ -237,7 +237,7 @@ def main(_argv):
                 for j in range(1, len(predicted_trajectories[track.track_id])):
                     start_point = predicted_trajectories[track.track_id][j-1]
                     end_point = predicted_trajectories[track.track_id][j]
-                    cv2.line(trail_overlay, start_point, end_point, (0, 255, 255), 5)  # Draw predicted trajectory in yellow
+                    cv2.line(prediction_overlay, start_point, end_point, (0, 255, 255), 2)  # Draw predicted trajectory in yellow
 
         if frame_num % t_frames == 0:
             track_ids = [track.track_id for track in tracker.tracks if track.track_id in tracking_data and len(tracking_data[track.track_id]) >= t_frames]
@@ -261,6 +261,7 @@ def main(_argv):
                     print(f"Error during prediction: {e}")
 
         frame = cv2.addWeighted(frame, 1, trail_overlay, 0.5, 0)
+        frame = cv2.addWeighted(frame, 1, prediction_overlay, 0.5, 0)
 
         fps = 1.0 / (time.time() - start_time)
         result = np.asarray(frame)
