@@ -1,16 +1,16 @@
 import os
-import argparse
 import time
 import torch
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
 from absl import app, flags
 from absl.flags import FLAGS
 from deep_sort import preprocessing, nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 from tools import generate_detections as gdet
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
 
 plt.style.use("seaborn-dark")
 from STGAT.data.loader import data_loader
@@ -24,12 +24,12 @@ from STGAT.utils import (
     get_dset_path,
 )
 
-flags.DEFINE_string('video', './data/video/test.mp4', 'path to input video or set to 0 for webcam')
+flags.DEFINE_string('video', '', 'URL to input video stream')
 flags.DEFINE_string('output', None, 'path to output video')
 flags.DEFINE_string('output_format', 'XVID', 'codec used in VideoWriter when saving video to file')
 flags.DEFINE_boolean('dont_show', False, 'dont show video output')
 flags.DEFINE_boolean('info', False, 'show detailed info of tracked objects')
-flags.DEFINE_boolean('count', False, 'count objects being tracked on screen')
+flags.DEFINE_boolean('count', True, 'count objects being tracked on screen')
 flags.DEFINE_string('stgat_model', './STGAT/model_best.pth.tar', 'path to STGAT model checkpoint')
 
 def get_stgat_model(model_path, obs, pred):
@@ -132,37 +132,40 @@ def evaluate(pred_traj_gt, pred_traj_fake, seq_start_end):
     return ade, fde
 
 def main(_argv):
+    FLAGS = flags.FLAGS
     max_cosine_distance = 0.4
     nn_budget = None
     nms_max_overlap = 1.0
-    obs = 8
-    pred = 12
-    skip = 5
+    obs = 12
+    pred = 16
+    skip = 3
     t_frames = obs * skip
     scale_factor = 20
+    max_frame_history = 150
 
-    model_filename = 'model_data/mars-small128.pb'
-    encoder = gdet.create_box_encoder(model_filename, batch_size=1)
+    # Load YOLOv5x6 model
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5x6', pretrained=True)
+    model.conf = 0.3  # Confidence threshold
+    model.iou = 0.8   # IoU threshold for NMS
+
+    encoder = gdet.create_box_encoder('model_data/mars-small128.pb', batch_size=1)
     metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
     tracker = Tracker(metric)
-
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', trust_repo=True)
-    model.eval()
 
     stgat_model = get_stgat_model(FLAGS.stgat_model, obs, pred)
 
     video_path = FLAGS.video
+    vid = cv2.VideoCapture(video_path)
 
-    try:
-        vid = cv2.VideoCapture(int(video_path))
-    except:
-        vid = cv2.VideoCapture(video_path)
+    if not vid.isOpened():
+        print("Error: Unable to open video stream")
+        return
 
     out = None
+    width, height = 800, 600  # Set desired output resolution
+    fps = int(vid.get(cv2.CAP_PROP_FPS))
+
     if FLAGS.output:
-        width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(vid.get(cv2.CAP_PROP_FPS))
         codec = cv2.VideoWriter_fourcc(*FLAGS.output_format)
         out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
 
@@ -173,26 +176,31 @@ def main(_argv):
     prediction_overlay = np.zeros((height, width, 3), dtype=np.uint8)  # For permanent predictions
 
     while True:
-        return_value, frame = vid.read()
-        if not return_value:
+        ret, frame = vid.read()
+        if not ret:
             print('Video has ended or failed, try a different video format!')
             break
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_num += 1
         start_time = time.time()
 
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (width, height))
+        frame_num += 1
+
         results = model(frame)
-        results = results.pandas().xyxy[0]
-        results = results[results['name'] == 'person']
+        detections = results.xyxy[0].cpu().numpy()  # Get bounding boxes in xyxy format
+        confidences = results.xyxy[0][:, 4].cpu().numpy()  # Get confidence scores
+        class_ids = results.xyxy[0][:, 5].cpu().numpy()  # Get class IDs
 
         bboxes = []
         scores = []
-        for index, row in results.iterrows():
-            x1, y1, x2, y2 = int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax'])
-            score = row['confidence']
-            bboxes.append([x1, y1, x2-x1, y2-y1])
-            scores.append(score)
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2 = det[:4]
+            score = confidences[i]
+            cls = class_ids[i]
+            if cls == 0:  # Only keep 'person' class
+                bboxes.append([x1, y1, x2-x1, y2-y1])
+                scores.append(score)
 
         bboxes = np.array(bboxes)
         scores = np.array(scores)
@@ -213,6 +221,11 @@ def main(_argv):
         tracker.predict()
         tracker.update(detections)
 
+        if frame_num % max_frame_history == 0:
+            trail_overlay = np.zeros((height, width, 3), dtype=np.uint8)
+            prediction_overlay = np.zeros((height, width, 3), dtype=np.uint8)
+
+        person_count = 0
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue
@@ -224,6 +237,8 @@ def main(_argv):
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
             cv2.putText(frame, class_name + "-" + str(track.track_id), (int(bbox[0]), int(bbox[1]-10)), 0, 0.75, (255,255,255), 2)
+
+            person_count += 1
 
             # Save trail and coordinates for STGAT input
             centroid = (float((bbox[0] + bbox[2]) / 2), float((bbox[1] + bbox[3]) / 2))
@@ -242,7 +257,6 @@ def main(_argv):
         if frame_num % t_frames == 0:
             track_ids = [track.track_id for track in tracker.tracks if track.track_id in tracking_data and len(tracking_data[track.track_id]) >= t_frames]
             if track_ids:  # Ensure track_ids is not empty
-                print(f"Frame #{frame_num}: Track IDs ready for prediction: {track_ids}")
                 try:
                     obs_traj, obs_traj_rel = prepare_stgat_input(tracking_data, track_ids, width, height, obs, skip, scale_factor)
                     seq_start_end = torch.tensor([(0, len(track_ids))], dtype=torch.int64).cuda()
@@ -253,8 +267,7 @@ def main(_argv):
                         predicted_coords = denormalize_coordinates(normalized_predicted_coords, width, height, scale_factor)
                         predicted_trajectories[track_id] = predicted_coords
 
-                        if track_id == 5:    
-                            print(f"Track ID {track_id} predicted trajectory:")
+                        if track_id == 5:
                             for coord in predicted_coords:
                                 print(f"{coord[0]}, {coord[1]}")
                 except Exception as e:
@@ -262,6 +275,10 @@ def main(_argv):
 
         frame = cv2.addWeighted(frame, 1, trail_overlay, 0.5, 0)
         frame = cv2.addWeighted(frame, 1, prediction_overlay, 0.5, 0)
+
+        # Display the count
+        count_text = f'Count: {person_count}'
+        cv2.putText(frame, count_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
         fps = 1.0 / (time.time() - start_time)
         result = np.asarray(frame)
@@ -307,8 +324,8 @@ def main(_argv):
         pred_traj_fake = torch.tensor(pred_traj_fake_list).cuda()
 
         # Ensure tensors are of shape (pred_len, num_tracks, 2)
-        print(f"pred_traj_gt shape: {pred_traj_gt.shape}")
-        print(f"pred_traj_fake shape: {pred_traj_fake.shape}")
+        #print(f"pred_traj_gt shape: {pred_traj_gt.shape}")
+        #print(f"pred_traj_fake shape: {pred_traj_fake.shape}")
 
         if len(pred_traj_gt.shape) == 3 and len(pred_traj_fake.shape) == 3:
             pred_traj_gt = pred_traj_gt.permute(1, 0, 2)
