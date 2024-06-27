@@ -159,24 +159,22 @@ def main(_argv):
     nms_max_overlap = 1.0
     obs = 12
     pred = 16
-    skip = 3
+    skip = 1
     t_frames = obs * skip
-    scale_factor = 20
-    max_frame_history = 60
-
-    # Define anchor ratios and scales
-    compound_coef = 0
+    scale_factor = 100
+    max_frame_history = 120
+    threshold = 0.3
+    iou_threshold = 0.2
+    compound_coef = 5
     force_input_size = None 
     anchor_ratios = [(1.0, 1.0), (1.4, 0.7), (0.7, 1.4)]
     anchor_scales = [2 ** 0, 2 ** (1.0 / 3.0), 2 ** (2.0 / 3.0)]
 
     use_cuda = True
     use_float16 = False
-    cudnn.fastest = True
-    cudnn.benchmark = True
+    torch.backends.cudnn.fastest = True
+    torch.backends.cudnn.benchmark = True
 
-    threshold = 0.1
-    iou_threshold = 0.1
 
     obj_list = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
                 'fire hydrant', '', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep',
@@ -232,13 +230,14 @@ def main(_argv):
     trail_overlay = np.zeros((height, width, 3), dtype=np.uint8)
     prediction_overlay = np.zeros((height, width, 3), dtype=np.uint8)  # For permanent predictions
 
+    ade = fde = 0.0
+
     while True:
         print("frame number : ", frame_num)
         return_value, frame = vid.read()
         if not return_value:
             print('Video has ended or failed, try a different video format!')
             break
-
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_num += 1
         start_time = time.time()
@@ -251,7 +250,6 @@ def main(_argv):
             x = torch.stack([torch.from_numpy(fi) for fi in framed_imgs], 0)
 
         x = x.to(torch.float32 if not use_float16 else torch.float16).permute(0, 3, 1, 2)
-        #print(f"Input Tensor Shape: {x.shape}")
 
         with torch.no_grad():
             features, regression, classification, anchors = model(x)
@@ -264,30 +262,32 @@ def main(_argv):
 
         detections = out[0]
 
-        #print(f"Detections: {detections}")
-
         bboxes = []
         scores = []
         for i in range(len(detections['rois'])):
-            #print(f"Detection entry: {detections['rois'][i]}")
             if detections['class_ids'][i] == 0:  # Only keep 'person' class
                 bboxes.append(detections['rois'][i])
                 scores.append(detections['scores'][i])
 
         bboxes = np.array(bboxes)
-        if bboxes.size > 0:
-            bboxes[:, 2] -= bboxes[:, 0]
-            bboxes[:, 3] -= bboxes[:, 1]
         scores = np.array(scores)
         classes = np.array([0] * len(scores))
 
-        features = encoder(frame, bboxes)
-        detections = [Detection(bbox, score, 'person', feature) for bbox, score, feature in zip(bboxes, scores, features)]
+        # Check if bboxes array is not empty before proceeding
+        if bboxes.size > 0:
+            # Ensure valid bounding boxes
+            valid_indices = (bboxes[:, 2] > bboxes[:, 0]) & (bboxes[:, 3] > bboxes[:, 1])
+            bboxes = bboxes[valid_indices]
+            scores = scores[valid_indices]
 
-        # Print the detections for debugging
-        for detection in detections:
-            #print(f"Detection: {detection}")
-            #print(f"Bbox1: {detection.tlwh}, Confidence: {detection.confidence}, Class: {detection.class_name}")
+            if bboxes.size > 0:
+                bboxes[:, 2] -= bboxes[:, 0]  # width
+                bboxes[:, 3] -= bboxes[:, 1]  # height
+
+            features = encoder(frame, bboxes)
+            detections = [Detection(bbox, score, 'person', feature) for bbox, score, feature in zip(bboxes, scores, features)]
+        else:
+            detections = []
 
         cmap = plt.get_cmap('tab20b')
         colors = [cmap(i)[:3] for i in np.linspace(0, 1, 20)]
@@ -295,6 +295,14 @@ def main(_argv):
         boxs = np.array([d.tlwh for d in detections])
         scores = np.array([d.confidence for d in detections])
         classes = np.array([d.class_name for d in detections])
+
+        # Filter out low-confidence detections
+        high_conf_indices = scores > 0.1
+        boxs = boxs[high_conf_indices]
+        scores = scores[high_conf_indices]
+        classes = classes[high_conf_indices]
+        detections = [detections[i] for i in range(len(detections)) if high_conf_indices[i]]
+
         indices = preprocessing.non_max_suppression(boxs, classes, nms_max_overlap, scores)
         detections = [detections[i] for i in indices]
 
@@ -310,12 +318,11 @@ def main(_argv):
                 continue
             bbox = track.to_tlbr()
             class_name = track.get_class()
-            print(f"Bbox2: {bbox}")
             color = colors[int(track.track_id) % len(colors)]
             color = [i * 255 for i in color]
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 1)
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-            cv2.putText(frame, class_name + "-" + str(track.track_id), (int(bbox[0]), int(bbox[1]-10)), 0, 0.75, (255,255,255), 2)
+            cv2.putText(frame, class_name + "-" + str(track.track_id), (int(bbox[0]), int(bbox[1]-10)), 0, 0.75, (255,255,255), 1)
 
             # Save trail and coordinates for STGAT input
             centroid = (float((bbox[0] + bbox[2]) / 2), float((bbox[1] + bbox[3]) / 2))
@@ -334,21 +341,60 @@ def main(_argv):
         if frame_num % t_frames == 0:
             track_ids = [track.track_id for track in tracker.tracks if track.track_id in tracking_data and len(tracking_data[track.track_id]) >= t_frames]
             if track_ids:  # Ensure track_ids is not empty
-                #print(f"Frame #{frame_num}: Track IDs ready for prediction: {track_ids}")
+                # Print debug info to ensure track IDs are being processed
+                print(f"Frame #{frame_num}: Track IDs ready for prediction: {track_ids}")
                 try:
                     obs_traj, obs_traj_rel = prepare_stgat_input(tracking_data, track_ids, width, height, obs, skip, scale_factor)
                     seq_start_end = torch.tensor([(0, len(track_ids))], dtype=torch.int64).cuda()
-                    pred_traj_fake_rel = stgat_model(obs_traj_rel, obs_traj, seq_start_end, 0, 3)
+
+                    # Print shapes and some values for debugging
+                    print("obs_traj shape:", obs_traj.shape)
+                    print("obs_traj_rel shape:", obs_traj_rel.shape)
+                    print("obs_traj for first object:", obs_traj[:, 0, :])
+
+                    pred_traj_fake_rel = stgat_model(obs_traj_rel, obs_traj, seq_start_end)  # Correct function call
+
+                    # Print predicted relative trajectory for debugging
+                    print("pred_traj_fake_rel shape:", pred_traj_fake_rel.shape)
+                    print("pred_traj_fake_rel sample:", pred_traj_fake_rel[:, 0, :])
+
                     pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
+                    
                     for i, track_id in enumerate(track_ids):
                         normalized_predicted_coords = [(coord[i][0].item(), coord[i][1].item()) for coord in pred_traj_fake]
                         predicted_coords = denormalize_coordinates(normalized_predicted_coords, width, height, scale_factor)
                         predicted_trajectories[track_id] = predicted_coords
 
-                        if track_id == 5:    
-                            print(f"Track ID {track_id} predicted trajectory:")
-                            for coord in predicted_coords:
-                                print(f"{coord[0]}, {coord[1]}")
+                    # Ensure `all_tracking_data` is correctly initialized
+                    if 'all_tracking_data' not in locals():
+                        all_tracking_data = []
+
+                    valid_track_ids = [track_id for track_id in track_ids if len([entry for entry in all_tracking_data if entry[1] == track_id]) >= pred]
+
+                    pred_traj_gt_list = [[[entry[2], entry[3]] for entry in all_tracking_data if entry[1] == track_id][-pred:] for track_id in valid_track_ids]
+                    pred_traj_fake_list = [[(coord[0], coord[1]) for coord in predicted_trajectories[track_id]] for track_id in valid_track_ids]
+
+                    if pred_traj_gt_list and pred_traj_fake_list:
+                        pred_traj_gt = torch.tensor(pred_traj_gt_list).cuda()
+                        pred_traj_fake = torch.tensor(pred_traj_fake_list).cuda()
+
+                        if len(pred_traj_gt.shape) == 3 and len(pred_traj_fake.shape) == 3:
+                            pred_traj_gt = pred_traj_gt.permute(1, 0, 2)
+                            pred_traj_fake = pred_traj_fake.permute(1, 0, 2)
+
+                            seq_start_end = torch.tensor([(0, pred_traj_fake.size(1))], dtype=torch.int64).cuda()
+
+                            ade, fde = evaluate(pred_traj_gt, pred_traj_fake, seq_start_end)
+                            ade = ade.item()
+                            fde = fde.item()
+
+                            print(f"Dataset: zara2, Pred Len: {pred}, ADE: {ade:.12f}, FDE: {fde:.12f}")
+                            with open("evaluation.txt", "w") as f:
+                                f.write(f"Dataset: zara2, Pred Len: {pred}, ADE: {ade:.12f}, FDE: {fde:.12f}\n")
+                        else:
+                            print("Error: Tensors do not have the correct shape for permute")
+                    else:
+                        print("Error: Empty prediction lists. No valid tracks for evaluation.")
                 except Exception as e:
                     print(f"Error during prediction: {e}")
 
@@ -358,6 +404,13 @@ def main(_argv):
         fps = 1.0 / (time.time() - start_time)
         result = np.asarray(frame)
         result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Display number of detected people, ADE, and FDE
+        num_detected_people = len([track for track in tracker.tracks if track.is_confirmed() and track.time_since_update <= 1])
+        cv2.putText(result, f"People Detected: {num_detected_people}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(result, f"Frame Number: {frame_num}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(result, f"ADE: {ade:.4f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(result, f"FDE: {fde:.4f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         if not FLAGS.dont_show:
             cv2.imshow("Output Video", result)
@@ -387,39 +440,7 @@ def main(_argv):
         out.release()
     cv2.destroyAllWindows()
 
-    # Evaluate the predictions
-    # Filter out tracks where predicted trajectory length does not match ground truth length
-    valid_track_ids = [track_id for track_id in predicted_trajectories.keys() if len([entry for entry in all_tracking_data if entry[1] == track_id]) >= pred]
-
-    pred_traj_gt_list = [[[entry[2], entry[3]] for entry in all_tracking_data if entry[1] == track_id][-pred:] for track_id in valid_track_ids]
-    pred_traj_fake_list = [[(coord[0], coord[1]) for coord in predicted_trajectories[track_id]] for track_id in valid_track_ids]
-    # Ensure lists are not empty before creating tensors
-    if pred_traj_gt_list and pred_traj_fake_list:
-        pred_traj_gt = torch.tensor(pred_traj_gt_list).cuda()
-        pred_traj_fake = torch.tensor(pred_traj_fake_list).cuda()
-
-        # Ensure tensors are of shape (pred_len, num_tracks, 2)
-        print(f"pred_traj_gt shape: {pred_traj_gt.shape}")
-        print(f"pred_traj_fake shape: {pred_traj_fake.shape}")
-
-        if len(pred_traj_gt.shape) == 3 and len(pred_traj_fake.shape) == 3:
-            pred_traj_gt = pred_traj_gt.permute(1, 0, 2)
-            pred_traj_fake = pred_traj_fake.permute(1, 0, 2)
-
-            seq_start_end = torch.tensor([(0, pred_traj_fake.size(1))], dtype=torch.int64).cuda()
-
-            ade, fde = evaluate(pred_traj_gt, pred_traj_fake, seq_start_end)
-
-            # Output scores to the terminal and a file
-            print(f"Dataset: zara2, Pred Len: {pred}, ADE: {ade:.12f}, FDE: {fde:.12f}")
-            with open("evaluation.txt", "w") as f:
-                f.write(f"Dataset: zara2, Pred Len: {pred}, ADE: {ade:.12f}, FDE: {fde:.12f}\n")
-        else:
-            print("Error: Tensors do not have the correct shape for permute")
-    else:
-        print("Error: Empty prediction lists. No valid tracks for evaluation.")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         app.run(main)
     except SystemExit:
